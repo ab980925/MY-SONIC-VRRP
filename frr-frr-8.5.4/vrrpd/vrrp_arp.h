@@ -33,4 +33,7 @@ extern bool vrrp_garp_is_init(void);
 extern void vrrp_garp_send(struct vrrp_router *vr, struct in_addr *v4);
 extern void vrrp_garp_send_all(struct vrrp_router *vr);
 
+extern int vrrp_lb_arp_start(struct vrrp_router *vr);
+extern void vrrp_lb_arp_stop(struct vrrp_router *vr);
+
 #endif /* __VRRP_ARP_H__ */

@@ -266,19 +266,49 @@ DEFPY_YANG(vrrp_preempt,
       VRRP_VRID_STR
       "Preempt mode\n")
 {
-	nb_cli_enqueue_change(vty, "./preempt", NB_OP_MODIFY,
-			      no ? "false" : "true");
+        nb_cli_enqueue_change(vty, "./preempt", NB_OP_MODIFY,
+                              no ? "false" : "true");
 
-	return nb_cli_apply_changes(vty, VRRP_XPATH_ENTRY, vrid);
+        return nb_cli_apply_changes(vty, VRRP_XPATH_ENTRY, vrid);
 }
 
 void cli_show_preempt(struct vty *vty, const struct lyd_node *dnode,
-		      bool show_defaults)
+                       bool show_defaults)
 {
-	const char *vrid = yang_dnode_get_string(dnode, "../virtual-router-id");
-	const bool pre = yang_dnode_get_bool(dnode, NULL);
+        const char *vrid = yang_dnode_get_string(dnode, "../virtual-router-id");
+        const bool pre = yang_dnode_get_bool(dnode, NULL);
 
-	vty_out(vty, " %svrrp %s preempt\n", pre ? "" : "no ", vrid);
+        vty_out(vty, " %svrrp %s preempt\n", pre ? "" : "no ", vrid);
+}
+
+/*
+ * XPath: /frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/mode
+ */
+DEFPY_YANG(vrrp_load_balance,
+      vrrp_load_balance_cmd,
+      "[no] vrrp (1-255)$vrid load-balance",
+      NO_STR
+      VRRP_STR
+      VRRP_VRID_STR
+      "Enable two-node IPv4 load-balancing\n")
+{
+        nb_cli_enqueue_change(vty, "./mode", NB_OP_MODIFY,
+                              no ? NULL : "load-balance");
+
+        return nb_cli_apply_changes(vty, VRRP_XPATH_ENTRY, vrid);
+}
+
+void cli_show_mode(struct vty *vty, const struct lyd_node *dnode,
+                   bool show_defaults)
+{
+        const char *vrid = yang_dnode_get_string(dnode, "../virtual-router-id");
+        const char *mode = yang_dnode_get_string(dnode, NULL);
+
+        if (show_defaults && strmatch(mode, "standard"))
+                return;
+
+        if (strmatch(mode, "load-balance"))
+                vty_out(vty, " vrrp %s load-balance\n", vrid);
 }
 
 /*
@@ -783,11 +813,12 @@ void vrrp_vty_init(void)
 	install_element(INTERFACE_NODE, &vrrp_shutdown_cmd);
 	install_element(INTERFACE_NODE, &vrrp_priority_cmd);
 	install_element(INTERFACE_NODE, &no_vrrp_priority_cmd);
-	install_element(INTERFACE_NODE, &vrrp_advertisement_interval_cmd);
-	install_element(INTERFACE_NODE, &no_vrrp_advertisement_interval_cmd);
-	install_element(INTERFACE_NODE, &vrrp_ip_cmd);
-	install_element(INTERFACE_NODE, &vrrp_ip6_cmd);
-	install_element(INTERFACE_NODE, &vrrp_preempt_cmd);
-	install_element(INTERFACE_NODE,
-			&vrrp_checksum_with_ipv4_pseudoheader_cmd);
+install_element(INTERFACE_NODE, &vrrp_advertisement_interval_cmd);
+install_element(INTERFACE_NODE, &no_vrrp_advertisement_interval_cmd);
+install_element(INTERFACE_NODE, &vrrp_ip_cmd);
+install_element(INTERFACE_NODE, &vrrp_ip6_cmd);
+install_element(INTERFACE_NODE, &vrrp_preempt_cmd);
+install_element(INTERFACE_NODE, &vrrp_load_balance_cmd);
+install_element(INTERFACE_NODE,
+&vrrp_checksum_with_ipv4_pseudoheader_cmd);
 }

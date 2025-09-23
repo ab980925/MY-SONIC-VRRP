@@ -82,6 +82,24 @@ module frr-vrrpd {
       default "3";
     }
 
+    leaf mode {
+      type enumeration {
+        enum "standard" {
+          value 0;
+          description
+            "Operate the virtual router in standard VRRP mode.";
+        }
+        enum "load-balance" {
+          value 1;
+          description
+            "Enable two-node active-active load-balancing for IPv4.";
+        }
+      }
+      default "standard";
+      description
+        "Configure the operational mode of the virtual router.";
+    }
+
     leaf priority {
       type uint8 {
         range "1..254";
@@ -146,52 +164,52 @@ module frr-vrrpd {
       type uint8;
       config false;
       description
-        "Operational value of the priority for the
-         interface in the VRRP group.";
+"Operational value of the priority for the
+ interface in the VRRP group.";
     }
 
     leaf vrrp-interface {
       type frr-interface:interface-ref;
       config false;
       description
-        "The interface used to transmit VRRP traffic.";
+"The interface used to transmit VRRP traffic.";
     }
 
     leaf source-address {
       type inet:ip-address;
       config false;
       description
-        "The source IP address used for VRRP advertisements.";
+"The source IP address used for VRRP advertisements.";
     }
 
     leaf state {
       type enumeration {
-        enum "Initialize" {
-          description
-            "State when virtual router is waiting for a Startup event.";
-        }
-        enum "Master" {
-          description
-            "State when virtual router is functioning as the forwarding router
-             for the virtual addresses.";
-        }
-        enum "Backup" {
-          description
-            "State when virtual router is monitoring the availability and state
-             of the Master router.";
-        }
+enum "Initialize" {
+  description
+    "State when virtual router is waiting for a Startup event.";
+}
+enum "Master" {
+  description
+    "State when virtual router is functioning as the forwarding router
+     for the virtual addresses.";
+}
+enum "Backup" {
+  description
+    "State when virtual router is monitoring the availability and state
+     of the Master router.";
+}
       }
       config false;
     }
 
     leaf master-advertisement-interval {
       type uint16 {
-        range "0..4095";
+range "0..4095";
       }
       units "centiseconds";
       config false;
       description
-        "Advertisement interval contained in advertisements received from the Master.";
+"Advertisement interval contained in advertisements received from the Master.";
     }
 
     leaf skew-time {
@@ -199,31 +217,31 @@ module frr-vrrpd {
       units "centiseconds";
       config false;
       description
-        "Time to skew Master_Down_Interval.";
+"Time to skew Master_Down_Interval.";
     }
 
     container counter {
       config false;
       leaf state-transition {
-        type yang:zero-based-counter32;
-        description
-          "Number of state transitions the virtual router has experienced.";
+type yang:zero-based-counter32;
+description
+  "Number of state transitions the virtual router has experienced.";
       }
 
       container tx {
-        leaf advertisement {
-          type yang:zero-based-counter32;
-          description
-            "Number of sent VRRP advertisements.";
-        }
+leaf advertisement {
+  type yang:zero-based-counter32;
+  description
+    "Number of sent VRRP advertisements.";
+}
       }
 
       container rx {
-        leaf advertisement {
-          type yang:zero-based-counter32;
-          description
-            "Number of received VRRP advertisements.";
-        }
+leaf advertisement {
+  type yang:zero-based-counter32;
+  description
+    "Number of received VRRP advertisements.";
+}
       }
     }
   }
@@ -233,55 +251,55 @@ module frr-vrrpd {
       "Top-level grouping for Virtual Router Redundancy Protocol";
     container vrrp {
       description
-        "Enclosing container for VRRP groups handled by this
-         IP interface";
+"Enclosing container for VRRP groups handled by this
+ IP interface";
       reference
-        "RFC 5798 - Virtual Router Redundancy Protocol
-         (VRRP) Version 3 for IPv4 and IPv6";
+"RFC 5798 - Virtual Router Redundancy Protocol
+ (VRRP) Version 3 for IPv4 and IPv6";
       list vrrp-group {
-        key "virtual-router-id";
-        description
-          "List of VRRP groups, keyed by virtual router id";
-        uses ip-vrrp-config;
+key "virtual-router-id";
+description
+  "List of VRRP groups, keyed by virtual router id";
+uses ip-vrrp-config;
 
-        container v4 {
-          leaf-list virtual-address {
-            type inet:ipv4-address;
-            description
-              "Configure one or more IPv4 virtual addresses for the
-               VRRP group";
-          }
+container v4 {
+  leaf-list virtual-address {
+    type inet:ipv4-address;
+    description
+      "Configure one or more IPv4 virtual addresses for the
+       VRRP group";
+  }
 
-          uses ip-vrrp-state {
-            augment "counter/tx" {
-              leaf gratuitous-arp {
-                type yang:zero-based-counter32;
-                description
-                  "Number of sent gratuitous ARP requests.";
-              }
-            }
-          }
-        }
+  uses ip-vrrp-state {
+    augment "counter/tx" {
+      leaf gratuitous-arp {
+type yang:zero-based-counter32;
+description
+  "Number of sent gratuitous ARP requests.";
+      }
+    }
+  }
+}
 
-        container v6 {
-          when "../version = 3";
-          leaf-list virtual-address {
-            type inet:ipv6-address;
-            description
-              "Configure one or more IPv6 virtual addresses for the
-               VRRP group";
-          }
+container v6 {
+  when "../version = 3";
+  leaf-list virtual-address {
+    type inet:ipv6-address;
+    description
+      "Configure one or more IPv6 virtual addresses for the
+       VRRP group";
+  }
 
-          uses ip-vrrp-state {
-            augment "counter/tx" {
-              leaf neighbor-advertisement {
-                type yang:zero-based-counter32;
-                description
-                  "Number of sent unsolicited Neighbor Advertisements.";
-              }
-            }
-          }
-        }
+  uses ip-vrrp-state {
+    augment "counter/tx" {
+      leaf neighbor-advertisement {
+type yang:zero-based-counter32;
+description
+  "Number of sent unsolicited Neighbor Advertisements.";
+      }
+    }
+  }
+}
       }
     }
   }

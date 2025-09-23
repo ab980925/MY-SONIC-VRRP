@@ -19,6 +19,12 @@
  */
 #include <zebra.h>
 
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <errno.h>
+
 #include "lib/hash.h"
 #include "lib/hook.h"
 #include "lib/if.h"
@@ -78,16 +84,166 @@ static const char *const vrrp_event_names[2] = {
  */
 static void vrrp_mac_set(struct ethaddr *mac, bool v6, uint8_t vrid)
 {
-	/*
-	 * V4: 00-00-5E-00-01-{VRID}
-	 * V6: 00-00-5E-00-02-{VRID}
-	 */
-	mac->octet[0] = 0x00;
-	mac->octet[1] = 0x00;
-	mac->octet[2] = 0x5E;
-	mac->octet[3] = 0x00;
-	mac->octet[4] = v6 ? 0x02 : 0x01;
-	mac->octet[5] = vrid;
+        /*
+         * V4: 00-00-5E-00-01-{VRID}
+         * V6: 00-00-5E-00-02-{VRID}
+         */
+        mac->octet[0] = 0x00;
+        mac->octet[1] = 0x00;
+        mac->octet[2] = 0x5E;
+        mac->octet[3] = 0x00;
+        mac->octet[4] = v6 ? 0x02 : 0x01;
+        mac->octet[5] = vrid;
+}
+
+static void vrrp_mac_set_load_balance(struct ethaddr *mac, uint8_t vrid,
+                                     bool master)
+{
+        mac->octet[0] = 0x00;
+        mac->octet[1] = 0x0F;
+        mac->octet[2] = 0xE2;
+        mac->octet[3] = 0xFF;
+        mac->octet[4] = vrid;
+        mac->octet[5] = master ? 0x10 : 0x20;
+}
+
+static void vrrp_mac_set_load_balance_peer(struct ethaddr *mac,
+                                           const struct ethaddr *current)
+{
+        *mac = *current;
+        mac->octet[5] = (current->octet[5] == 0x10) ? 0x20 : 0x10;
+}
+
+static bool vrrp_mac_is_load_balance(const uint8_t *mac)
+{
+        return mac[0] == 0x00 && mac[1] == 0x0F && mac[2] == 0xE2
+               && mac[3] == 0xFF && (mac[5] == 0x10 || mac[5] == 0x20);
+}
+
+static int vrrp_netlink_set_mac(struct interface *ifp,
+                                const struct ethaddr *mac)
+{
+        struct {
+                struct nlmsghdr n;
+                struct ifinfomsg ifi;
+                char buf[64];
+        } req;
+        struct sockaddr_nl snl = {
+                .nl_family = AF_NETLINK,
+        };
+        struct rtattr *rta;
+        struct iovec iov;
+        struct msghdr msg;
+        char resp[NLMSG_LENGTH(sizeof(struct nlmsgerr))];
+        struct iovec riov;
+        struct msghdr rmsg;
+        struct nlmsghdr *h;
+        int fd = -1;
+        int ret = -1;
+
+        if (!ifp || ifp->ifindex <= 0)
+                return -1;
+
+        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+        if (fd < 0) {
+                zlog_err(VRRP_LOGPFX
+                         "Failed to open netlink socket to set MAC on %s: %s",
+                         ifp->name, safe_strerror(errno));
+                return -1;
+        }
+
+        memset(&req, 0, sizeof(req));
+        req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+        req.n.nlmsg_type = RTM_NEWLINK;
+        req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        req.ifi.ifi_family = AF_UNSPEC;
+        req.ifi.ifi_index = ifp->ifindex;
+        req.ifi.ifi_change = 0xFFFFFFFF;
+
+        rta = (struct rtattr *)(((char *)&req)
+                                + NLMSG_ALIGN(req.n.nlmsg_len));
+        rta->rta_type = IFLA_ADDRESS;
+        rta->rta_len = RTA_LENGTH(sizeof(mac->octet));
+        memcpy(RTA_DATA(rta), mac->octet, sizeof(mac->octet));
+        req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + rta->rta_len;
+
+        memset(&msg, 0, sizeof(msg));
+        iov.iov_base = &req;
+        iov.iov_len = req.n.nlmsg_len;
+        msg.msg_name = &snl;
+        msg.msg_namelen = sizeof(snl);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        if (sendmsg(fd, &msg, 0) < 0) {
+                zlog_err(VRRP_LOGPFX
+                         "Failed to send netlink message to set MAC on %s: %s",
+                         ifp->name, safe_strerror(errno));
+                goto out;
+        }
+
+        memset(resp, 0, sizeof(resp));
+        memset(&rmsg, 0, sizeof(rmsg));
+        memset(&riov, 0, sizeof(riov));
+        riov.iov_base = resp;
+        riov.iov_len = sizeof(resp);
+        rmsg.msg_name = &snl;
+        rmsg.msg_namelen = sizeof(snl);
+        rmsg.msg_iov = &riov;
+        rmsg.msg_iovlen = 1;
+
+        if (recvmsg(fd, &rmsg, 0) < 0) {
+                zlog_err(VRRP_LOGPFX
+                         "Failed to receive netlink response while setting MAC on %s: %s",
+                         ifp->name, safe_strerror(errno));
+                goto out;
+        }
+
+        h = (struct nlmsghdr *)resp;
+        if (h->nlmsg_type == NLMSG_ERROR) {
+                struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(h);
+
+                if (err->error) {
+                        zlog_err(VRRP_LOGPFX
+                                 "Kernel rejected MAC update on %s: %s",
+                                 ifp->name, safe_strerror(-err->error));
+                        goto out;
+                }
+        }
+
+        memcpy(ifp->hw_addr, mac->octet, sizeof(mac->octet));
+        ifp->hw_addr_len = sizeof(mac->octet);
+        ret = 0;
+
+out:
+        if (fd >= 0)
+                close(fd);
+
+        return ret;
+}
+
+static int vrrp_apply_role_mac(struct vrrp_router *r, bool master_role)
+{
+        struct ethaddr desired;
+
+        if (!r->vr->load_balance || r->family != AF_INET)
+                return 0;
+
+        vrrp_mac_set_load_balance(&desired, r->vr->vrid, master_role);
+
+        if (!memcmp(&desired, &r->vmac, sizeof(desired)))
+                return 0;
+
+        if (!r->mvl_ifp)
+                return -1;
+
+        if (vrrp_netlink_set_mac(r->mvl_ifp, &desired) < 0)
+                return -1;
+
+        r->vmac = desired;
+        r->vr->vmac = desired;
+
+        return 0;
 }
 
 /*
@@ -168,14 +324,18 @@ static bool vrrp_is_owner(struct interface *ifp, struct ipaddr *addr)
  */
 static bool vrrp_ifp_has_vrrp_mac(struct interface *ifp)
 {
-	struct ethaddr vmac4;
-	struct ethaddr vmac6;
+        struct ethaddr vmac4;
+        struct ethaddr vmac6;
 
-	vrrp_mac_set(&vmac4, 0, 0x00);
-	vrrp_mac_set(&vmac6, 1, 0x00);
+        if (ifp->hw_addr_len >= sizeof(struct ethaddr)
+            && vrrp_mac_is_load_balance(ifp->hw_addr))
+                return true;
 
-	return !memcmp(ifp->hw_addr, vmac4.octet, sizeof(vmac4.octet) - 1)
-	       || !memcmp(ifp->hw_addr, vmac6.octet, sizeof(vmac6.octet) - 1);
+        vrrp_mac_set(&vmac4, 0, 0x00);
+        vrrp_mac_set(&vmac6, 1, 0x00);
+
+        return !memcmp(ifp->hw_addr, vmac4.octet, sizeof(vmac4.octet) - 1)
+               || !memcmp(ifp->hw_addr, vmac6.octet, sizeof(vmac6.octet) - 1);
 }
 
 /*
@@ -336,13 +496,18 @@ void vrrp_check_start(struct vrrp_vrouter *vr)
 
 	whynot = NULL;
 
-	r = vr->v6;
-	/* Must not already be started */
-	start = r->fsm.state == VRRP_STATE_INITIALIZE;
-	whynot = (!start && !whynot) ? "Already running" : whynot;
-	/* Must not be v2 */
-	start = start && vr->version != 2;
-	whynot = (!start && !whynot) ? "VRRPv2 does not support v6" : whynot;
+        r = vr->v6;
+        /* Must not already be started */
+        start = r->fsm.state == VRRP_STATE_INITIALIZE;
+        whynot = (!start && !whynot) ? "Already running" : whynot;
+        if (vr->load_balance)
+                start = false;
+        whynot = (!start && !whynot && vr->load_balance)
+                         ? "Load-balance mode is IPv4-only"
+                         : whynot;
+        /* Must not be v2 */
+        start = start && vr->version != 2;
+        whynot = (!start && !whynot) ? "VRRPv2 does not support v6" : whynot;
 	/* Must have a parent interface */
 	start = start && (vr->ifp != NULL);
 	whynot = (!start && !whynot) ? "No base interface" : whynot;
@@ -388,14 +553,34 @@ void vrrp_set_priority(struct vrrp_vrouter *vr, uint8_t priority)
 }
 
 void vrrp_set_advertisement_interval(struct vrrp_vrouter *vr,
-				     uint16_t advertisement_interval)
+                                     uint16_t advertisement_interval)
 {
-	if (vr->advertisement_interval == advertisement_interval)
-		return;
+        if (vr->advertisement_interval == advertisement_interval)
+                return;
 
-	vr->advertisement_interval = advertisement_interval;
-	vrrp_recalculate_timers(vr->v4);
-	vrrp_recalculate_timers(vr->v6);
+        vr->advertisement_interval = advertisement_interval;
+        vrrp_recalculate_timers(vr->v4);
+        vrrp_recalculate_timers(vr->v6);
+}
+
+void vrrp_set_load_balance(struct vrrp_vrouter *vr, bool enable)
+{
+        vr->load_balance = enable;
+
+        if (enable) {
+                vrrp_mac_set_load_balance(&vr->vmac, vr->vrid, false);
+                vr->v4->vmac = vr->vmac;
+                if (vr->v4->mvl_ifp)
+                        vrrp_netlink_set_mac(vr->v4->mvl_ifp, &vr->vmac);
+        } else {
+                memset(&vr->vmac, 0, sizeof(vr->vmac));
+                vrrp_mac_set(&vr->v4->vmac, false, vr->vrid);
+                if (vr->v4->mvl_ifp)
+                        vrrp_netlink_set_mac(vr->v4->mvl_ifp, &vr->v4->vmac);
+        }
+
+        if (vr->v4->mvl_ifp)
+                vrrp_attach_interface(vr->v4);
 }
 
 static bool vrrp_has_ip(struct vrrp_vrouter *vr, struct ipaddr *ip)
@@ -593,35 +778,45 @@ static bool vrrp_attach_interface(struct vrrp_router *r)
 }
 
 static struct vrrp_router *vrrp_router_create(struct vrrp_vrouter *vr,
-					      int family)
+                                              int family)
 {
-	struct vrrp_router *r =
-		XCALLOC(MTYPE_VRRP_RTR, sizeof(struct vrrp_router));
+        struct vrrp_router *r =
+                XCALLOC(MTYPE_VRRP_RTR, sizeof(struct vrrp_router));
 
-	r->family = family;
-	r->sock_rx = -1;
-	r->sock_tx = -1;
-	r->vr = vr;
-	r->addrs = list_new();
-	r->addrs->del = vrrp_router_addr_list_del_cb;
-	r->priority = vr->priority;
-	r->fsm.state = VRRP_STATE_INITIALIZE;
-	vrrp_mac_set(&r->vmac, family == AF_INET6, vr->vrid);
+        r->family = family;
+        r->sock_rx = -1;
+        r->sock_tx = -1;
+        r->sock_arp = -1;
+        r->t_arp_read = NULL;
+        r->vr = vr;
+        r->addrs = list_new();
+        r->addrs->del = vrrp_router_addr_list_del_cb;
+        r->priority = vr->priority;
+        r->fsm.state = VRRP_STATE_INITIALIZE;
+        vrrp_mac_set(&r->vmac, family == AF_INET6, vr->vrid);
+        if (family == AF_INET && vr->load_balance)
+                r->vmac = vr->vmac;
 
-	vrrp_attach_interface(r);
+        vrrp_attach_interface(r);
 
-	return r;
+        return r;
 }
 
 static void vrrp_router_destroy(struct vrrp_router *r)
 {
-	if (r->is_active)
-		vrrp_event(r, VRRP_EVENT_SHUTDOWN);
+        if (r->is_active)
+                vrrp_event(r, VRRP_EVENT_SHUTDOWN);
 
-	if (r->sock_rx >= 0)
-		close(r->sock_rx);
-	if (r->sock_tx >= 0)
-		close(r->sock_tx);
+        THREAD_OFF(r->t_arp_read);
+        if (r->sock_arp >= 0) {
+                close(r->sock_arp);
+                r->sock_arp = -1;
+        }
+
+        if (r->sock_rx >= 0)
+                close(r->sock_rx);
+        if (r->sock_tx >= 0)
+                close(r->sock_tx);
 
 	/* FIXME: also delete list elements */
 	list_delete(&r->addrs);
@@ -633,26 +828,28 @@ struct vrrp_vrouter *vrrp_vrouter_create(struct interface *ifp, uint8_t vrid,
 {
 	struct vrrp_vrouter *vr = vrrp_lookup(ifp, vrid);
 
-	if (vr)
-		return vr;
+        if (vr)
+                return vr;
 
-	if (version != 2 && version != 3)
-		return NULL;
+        if (version != 2 && version != 3)
+                return NULL;
 
-	vr = XCALLOC(MTYPE_VRRP_RTR, sizeof(struct vrrp_vrouter));
+        vr = XCALLOC(MTYPE_VRRP_RTR, sizeof(struct vrrp_vrouter));
 
-	vr->ifp = ifp;
-	vr->version = version;
-	vr->vrid = vrid;
-	vr->priority = vd.priority;
-	vr->preempt_mode = vd.preempt_mode;
-	vr->accept_mode = vd.accept_mode;
-	vr->checksum_with_ipv4_pseudoheader =
-		vd.checksum_with_ipv4_pseudoheader;
-	vr->shutdown = vd.shutdown;
+        vr->ifp = ifp;
+        vr->version = version;
+        vr->vrid = vrid;
+        vr->priority = vd.priority;
+        vr->preempt_mode = vd.preempt_mode;
+        vr->accept_mode = vd.accept_mode;
+        vr->checksum_with_ipv4_pseudoheader =
+                vd.checksum_with_ipv4_pseudoheader;
+        vr->shutdown = vd.shutdown;
+        vr->load_balance = false;
+        memset(&vr->vmac, 0, sizeof(vr->vmac));
 
-	vr->v4 = vrrp_router_create(vr, AF_INET);
-	vr->v6 = vrrp_router_create(vr, AF_INET6);
+        vr->v4 = vrrp_router_create(vr, AF_INET);
+        vr->v6 = vrrp_router_create(vr, AF_INET6);
 
 	vrrp_set_advertisement_interval(vr, vd.advertisement_interval);
 
@@ -1364,12 +1561,22 @@ DEFINE_HOOK(vrrp_change_state_hook, (struct vrrp_router *r, int to), (r, to));
  */
 static void vrrp_change_state_master(struct vrrp_router *r)
 {
-	/* Enable ND Router Advertisements */
-	if (r->family == AF_INET6)
-		vrrp_zebra_radv_set(r, true);
+        if (r->vr->load_balance && r->family == AF_INET)
+                if (vrrp_apply_role_mac(r, true) < 0)
+                        zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                                  "Unable to program master MAC on %s",
+                                  r->vr->vrid, r->mvl_ifp ? r->mvl_ifp->name
+                                                         : "<none>");
 
-	/* Set protodown off */
-	vrrp_zclient_send_interface_protodown(r->mvl_ifp, false);
+        if (r->vr->load_balance && r->family == AF_INET)
+                vrrp_lb_arp_start(r);
+
+        /* Enable ND Router Advertisements */
+        if (r->family == AF_INET6)
+                vrrp_zebra_radv_set(r, true);
+
+        /* Set protodown off */
+        vrrp_zclient_send_interface_protodown(r->mvl_ifp, false);
 
 	/*
 	 * If protodown is already off, we can send our stuff, otherwise we
@@ -1413,19 +1620,27 @@ static void vrrp_change_state_master(struct vrrp_router *r)
  */
 static void vrrp_change_state_backup(struct vrrp_router *r)
 {
-	/* Disable ND Router Advertisements */
-	if (r->family == AF_INET6)
-		vrrp_zebra_radv_set(r, false);
+        /* Disable ND Router Advertisements */
+        if (r->family == AF_INET6)
+                vrrp_zebra_radv_set(r, false);
 
-	/* Disable Adver_Timer */
-	THREAD_OFF(r->t_adver_timer);
+        /* Disable Adver_Timer */
+        THREAD_OFF(r->t_adver_timer);
 
-	r->advert_pending = false;
-	r->garp_pending = false;
-	r->ndisc_pending = false;
-	memset(&r->src, 0x00, sizeof(r->src));
+        r->advert_pending = false;
+        r->garp_pending = false;
+        r->ndisc_pending = false;
+        memset(&r->src, 0x00, sizeof(r->src));
 
-	vrrp_zclient_send_interface_protodown(r->mvl_ifp, true);
+        if (r->vr->load_balance && r->family == AF_INET) {
+                if (vrrp_apply_role_mac(r, false) < 0)
+                        zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                                  "Unable to program backup MAC on %s",
+                                  r->vr->vrid, r->mvl_ifp ? r->mvl_ifp->name
+                                                         : "<none>");
+                vrrp_lb_arp_stop(r);
+        } else
+                vrrp_zclient_send_interface_protodown(r->mvl_ifp, true);
 }
 
 /*
@@ -1446,9 +1661,12 @@ static void vrrp_change_state_initialize(struct vrrp_router *r)
 	r->garp_pending = false;
 	r->ndisc_pending = false;
 
-	/* Disable ND Router Advertisements */
-	if (r->family == AF_INET6 && r->mvl_ifp)
-		vrrp_zebra_radv_set(r, false);
+        /* Disable ND Router Advertisements */
+        if (r->family == AF_INET6 && r->mvl_ifp)
+                vrrp_zebra_radv_set(r, false);
+
+        if (r->vr->load_balance && r->family == AF_INET)
+                vrrp_lb_arp_stop(r);
 }
 
 void (*const vrrp_change_state_handlers[])(struct vrrp_router *vr) = {
@@ -1645,14 +1863,16 @@ static int vrrp_shutdown(struct vrrp_router *r)
 	}
 
 	/* Cancel all timers */
-	THREAD_OFF(r->t_adver_timer);
-	THREAD_OFF(r->t_master_down_timer);
-	THREAD_OFF(r->t_read);
-	THREAD_OFF(r->t_write);
+        THREAD_OFF(r->t_adver_timer);
+        THREAD_OFF(r->t_master_down_timer);
+        THREAD_OFF(r->t_read);
+        THREAD_OFF(r->t_write);
 
-	/* Protodown macvlan */
-	if (r->mvl_ifp)
-		vrrp_zclient_send_interface_protodown(r->mvl_ifp, true);
+        vrrp_lb_arp_stop(r);
+
+        /* Protodown macvlan */
+        if (r->mvl_ifp)
+                vrrp_zclient_send_interface_protodown(r->mvl_ifp, true);
 
 	/* Throw away our source address */
 	memset(&r->src, 0x00, sizeof(r->src));

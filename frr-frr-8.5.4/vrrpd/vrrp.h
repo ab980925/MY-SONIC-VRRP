@@ -188,7 +188,16 @@ struct vrrp_router {
 	 * advertisements, advertised in ARP requests/responses, and advertised
 	 * in ND Neighbor Advertisements.
 	 */
-	struct ethaddr vmac;
+        struct ethaddr vmac;
+
+        /*
+         * Raw socket used for ARP interception in load-balance mode.
+         * Only valid for IPv4 instances when vr->load_balance is true.
+         */
+        int sock_arp;
+
+        /* Thread handler that processes packets received on sock_arp. */
+        struct thread *t_arp_read;
 
 	struct {
 		int state;
@@ -274,7 +283,13 @@ struct vrrp_vrouter {
 	 *
 	 * This option should only affect IPv4 virtual routers.
 	 */
-	bool checksum_with_ipv4_pseudoheader;
+        bool checksum_with_ipv4_pseudoheader;
+
+        /* Load-balance operation mode (IPv4 only). */
+        bool load_balance;
+
+        /* Currently programmed MAC address on the macvlan interface. */
+        struct ethaddr vmac;
 
 	struct vrrp_router *v4;
 	struct vrrp_router *v6;
@@ -352,7 +367,13 @@ void vrrp_set_priority(struct vrrp_vrouter *vr, uint8_t priority);
  *    New advertisement interval
  */
 void vrrp_set_advertisement_interval(struct vrrp_vrouter *vr,
-				     uint16_t advertisement_interval);
+     uint16_t advertisement_interval);
+
+/*
+ * Enable or disable load-balance mode on the given Virtual Router.
+ * Only applies to IPv4 instances.
+ */
+void vrrp_set_load_balance(struct vrrp_vrouter *vr, bool enable);
 
 /*
  * Add an IPvX address to a VRRP Virtual Router.
