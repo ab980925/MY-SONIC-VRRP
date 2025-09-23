@@ -256,13 +256,91 @@ static int vrrp_apply_role_mac(struct vrrp_router *r, bool master_role)
  */
 static void vrrp_recalculate_timers(struct vrrp_router *r)
 {
-	uint16_t mdiadv = r->vr->version == 3 ? r->master_adver_interval
-					      : r->vr->advertisement_interval;
-	uint16_t skm = (r->vr->version == 3) ? r->master_adver_interval : 100;
+        uint16_t mdiadv = r->vr->version == 3 ? r->master_adver_interval
+                                              : r->vr->advertisement_interval;
+        uint16_t skm = (r->vr->version == 3) ? r->master_adver_interval : 100;
 
-	r->skew_time = ((256 - r->vr->priority) * skm) / 256;
-	r->master_down_interval = 3 * mdiadv;
-	r->master_down_interval += r->skew_time;
+        r->skew_time = ((256 - r->vr->priority) * skm) / 256;
+        r->master_down_interval = 3 * mdiadv;
+        r->master_down_interval += r->skew_time;
+}
+
+static void vrrp_lb_peer_timer_expire(struct thread *thread);
+
+static void vrrp_lb_peer_timer_start(struct vrrp_router *r)
+{
+        uint32_t interval_cs;
+        uint32_t adv;
+
+        if (!r->vr->load_balance || r->family != AF_INET)
+                return;
+
+        if (r->vr->version == 3 && r->master_adver_interval == 0)
+                r->master_adver_interval = r->vr->advertisement_interval;
+
+        vrrp_recalculate_timers(r);
+
+        interval_cs = r->master_down_interval;
+        if (!interval_cs) {
+                adv = r->vr->advertisement_interval;
+                if (!adv)
+                        adv = VRRP_DEFAULT_ADVINT;
+                interval_cs = 3 * adv;
+                interval_cs += ((256 - r->vr->priority) * adv) / 256;
+        }
+
+        THREAD_OFF(r->t_peer_down_timer);
+        thread_add_timer_msec(master, vrrp_lb_peer_timer_expire, r,
+                              interval_cs * CS2MS, &r->t_peer_down_timer);
+}
+
+static void vrrp_lb_peer_down(struct vrrp_router *r, const char *reason)
+{
+        bool was_alive;
+
+        if (!r->vr->load_balance || r->family != AF_INET)
+                return;
+
+        was_alive = r->lb_peer_alive;
+        r->lb_peer_alive = false;
+
+        if (!was_alive)
+                return;
+
+        zlog_info(VRRP_LOGPFX VRRP_LOGPFX_VRID VRRP_LOGPFX_FAM
+                  "Load-balance peer considered down: %s",
+                  r->vr->vrid, family2str(r->family),
+                  reason ? reason : "unknown");
+
+        vrrp_lb_update_all_neighbors(r, true);
+
+        for (int i = 0; i < 3; ++i)
+                vrrp_garp_send_all(r);
+}
+
+static void vrrp_lb_peer_up(struct vrrp_router *r, const char *reason)
+{
+        if (!r->vr->load_balance || r->family != AF_INET)
+                return;
+
+        if (!r->lb_peer_alive) {
+                zlog_info(VRRP_LOGPFX VRRP_LOGPFX_VRID VRRP_LOGPFX_FAM
+                          "Load-balance peer considered up: %s",
+                          r->vr->vrid, family2str(r->family),
+                          reason ? reason : "unknown");
+                r->lb_peer_alive = true;
+                vrrp_lb_update_all_neighbors(r, false);
+        }
+
+        vrrp_lb_peer_timer_start(r);
+}
+
+static void vrrp_lb_peer_timer_expire(struct thread *thread)
+{
+        struct vrrp_router *r = THREAD_ARG(thread);
+
+        r->t_peer_down_timer = NULL;
+        vrrp_lb_peer_down(r, "timer expired");
 }
 
 /*
@@ -573,11 +651,15 @@ void vrrp_set_load_balance(struct vrrp_vrouter *vr, bool enable)
                 vr->v4->vmac = vr->vmac;
                 if (vr->v4->mvl_ifp)
                         vrrp_netlink_set_mac(vr->v4->mvl_ifp, &vr->vmac);
+                if (vr->v4->fsm.state == VRRP_STATE_MASTER)
+                        vrrp_lb_peer_up(vr->v4, "load-balance enabled");
         } else {
                 memset(&vr->vmac, 0, sizeof(vr->vmac));
                 vrrp_mac_set(&vr->v4->vmac, false, vr->vrid);
                 if (vr->v4->mvl_ifp)
                         vrrp_netlink_set_mac(vr->v4->mvl_ifp, &vr->v4->vmac);
+                THREAD_OFF(vr->v4->t_peer_down_timer);
+                vr->v4->lb_peer_alive = false;
         }
 
         if (vr->v4->mvl_ifp)
@@ -802,6 +884,8 @@ static struct vrrp_router *vrrp_router_create(struct vrrp_vrouter *vr,
         r->lb_static_neigh = list_new();
         if (r->lb_static_neigh)
                 r->lb_static_neigh->del = vrrp_lb_neighbor_list_del_cb;
+        r->lb_peer_alive = false;
+        r->t_peer_down_timer = NULL;
         r->priority = vr->priority;
         r->fsm.state = VRRP_STATE_INITIALIZE;
         vrrp_mac_set(&r->vmac, family == AF_INET6, vr->vrid);
@@ -819,6 +903,7 @@ static void vrrp_router_destroy(struct vrrp_router *r)
                 vrrp_event(r, VRRP_EVENT_SHUTDOWN);
 
         THREAD_OFF(r->t_arp_read);
+        THREAD_OFF(r->t_peer_down_timer);
         if (r->sock_arp >= 0) {
                 close(r->sock_arp);
                 r->sock_arp = -1;
@@ -1117,14 +1202,26 @@ static int vrrp_recv_advertisement(struct vrrp_router *r, struct ipaddr *src,
 
 	int addrcmp;
 
-	switch (r->fsm.state) {
-	case VRRP_STATE_MASTER:
-		addrcmp = ipaddr_cmp(src, &r->src);
+        switch (r->fsm.state) {
+        case VRRP_STATE_MASTER:
+                addrcmp = ipaddr_cmp(src, &r->src);
 
-		if (pkt->hdr.priority == 0) {
-			vrrp_send_advertisement(r);
-			THREAD_OFF(r->t_adver_timer);
-			thread_add_timer_msec(
+                if (addrcmp != 0 && r->vr->load_balance
+                    && r->family == AF_INET) {
+                        if (pkt->hdr.priority == 0) {
+                                THREAD_OFF(r->t_peer_down_timer);
+                                vrrp_lb_peer_down(
+                                        r,
+                                        "received priority 0 advertisement");
+                        } else {
+                                vrrp_lb_peer_up(r, "advertisement received");
+                        }
+                }
+
+                if (pkt->hdr.priority == 0) {
+                        vrrp_send_advertisement(r);
+                        THREAD_OFF(r->t_adver_timer);
+                        thread_add_timer_msec(
 				master, vrrp_adver_timer_expire, r,
 				r->vr->advertisement_interval * CS2MS,
 				&r->t_adver_timer);
@@ -1584,6 +1681,9 @@ static void vrrp_change_state_master(struct vrrp_router *r)
         if (r->vr->load_balance && r->family == AF_INET)
                 vrrp_lb_arp_start(r);
 
+        if (r->vr->load_balance && r->family == AF_INET)
+                vrrp_lb_peer_up(r, "enter master state");
+
         /* Enable ND Router Advertisements */
         if (r->family == AF_INET6)
                 vrrp_zebra_radv_set(r, true);
@@ -1639,6 +1739,8 @@ static void vrrp_change_state_backup(struct vrrp_router *r)
 
         /* Disable Adver_Timer */
         THREAD_OFF(r->t_adver_timer);
+        THREAD_OFF(r->t_peer_down_timer);
+        r->lb_peer_alive = false;
 
         r->advert_pending = false;
         r->garp_pending = false;
@@ -1670,9 +1772,12 @@ static void vrrp_change_state_initialize(struct vrrp_router *r)
 	r->master_adver_interval = 0;
 	vrrp_recalculate_timers(r);
 
-	r->advert_pending = false;
-	r->garp_pending = false;
-	r->ndisc_pending = false;
+        r->advert_pending = false;
+        r->garp_pending = false;
+        r->ndisc_pending = false;
+        r->lb_peer_alive = false;
+
+        THREAD_OFF(r->t_peer_down_timer);
 
         /* Disable ND Router Advertisements */
         if (r->family == AF_INET6 && r->mvl_ifp)
@@ -1875,9 +1980,10 @@ static int vrrp_shutdown(struct vrrp_router *r)
 		return 0;
 	}
 
-	/* Cancel all timers */
+        /* Cancel all timers */
         THREAD_OFF(r->t_adver_timer);
         THREAD_OFF(r->t_master_down_timer);
+        THREAD_OFF(r->t_peer_down_timer);
         THREAD_OFF(r->t_read);
         THREAD_OFF(r->t_write);
 
