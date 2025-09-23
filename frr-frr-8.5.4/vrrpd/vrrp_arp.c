@@ -339,6 +339,142 @@ out:
                 close(fd);
 }
 
+static struct vrrp_lb_neighbor *
+vrrp_lb_neighbor_lookup(struct vrrp_router *r, const struct in_addr *ip)
+{
+        struct listnode *ln;
+        struct vrrp_lb_neighbor *entry;
+
+        if (!r->lb_static_neigh)
+                return NULL;
+
+        for (ALL_LIST_ELEMENTS_RO(r->lb_static_neigh, ln, entry))
+                if (entry->ip.s_addr == ip->s_addr)
+                        return entry;
+
+        return NULL;
+}
+
+static void vrrp_lb_neighbor_track(struct vrrp_router *r,
+                                  const struct in_addr *ip,
+                                  const struct ethaddr *mac)
+{
+        struct vrrp_lb_neighbor *entry;
+
+        if (!r->lb_static_neigh)
+                return;
+
+        entry = vrrp_lb_neighbor_lookup(r, ip);
+        if (entry) {
+                entry->mac = *mac;
+                return;
+        }
+
+        entry = XCALLOC(MTYPE_VRRP_LB_NEIGH, sizeof(*entry));
+        entry->ip = *ip;
+        entry->mac = *mac;
+        listnode_add(r->lb_static_neigh, entry);
+}
+
+static void vrrp_lb_neigh_delete(struct vrrp_router *r,
+                                 const struct vrrp_lb_neighbor *entry)
+{
+        struct {
+                struct nlmsghdr n;
+                struct ndmsg ndm;
+                char buf[64];
+        } req;
+        struct sockaddr_nl snl = {
+                .nl_family = AF_NETLINK,
+        };
+        struct rtattr *rta;
+        struct iovec iov;
+        struct msghdr msg;
+        char resp[NLMSG_LENGTH(sizeof(struct nlmsgerr))];
+        struct iovec riov;
+        struct msghdr rmsg;
+        int fd = -1;
+
+        if (!r->mvl_ifp || r->mvl_ifp->ifindex <= 0)
+                return;
+
+        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+        if (fd < 0) {
+                zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                          "Unable to open netlink socket for neighbor delete on %s: %s",
+                          r->vr->vrid, r->mvl_ifp->name, safe_strerror(errno));
+                return;
+        }
+
+        memset(&req, 0, sizeof(req));
+        req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+        req.n.nlmsg_type = RTM_DELNEIGH;
+        req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        req.ndm.ndm_family = AF_INET;
+        req.ndm.ndm_ifindex = r->mvl_ifp->ifindex;
+        req.ndm.ndm_state = NUD_PERMANENT;
+
+        rta = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
+        rta->rta_type = NDA_DST;
+        rta->rta_len = RTA_LENGTH(sizeof(entry->ip.s_addr));
+        memcpy(RTA_DATA(rta), &entry->ip.s_addr, sizeof(entry->ip.s_addr));
+        req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + rta->rta_len;
+
+        rta = (struct rtattr *)(((char *)&req) + NLMSG_ALIGN(req.n.nlmsg_len));
+        rta->rta_type = NDA_LLADDR;
+        rta->rta_len = RTA_LENGTH(sizeof(entry->mac.octet));
+        memcpy(RTA_DATA(rta), entry->mac.octet, sizeof(entry->mac.octet));
+        req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + rta->rta_len;
+
+        memset(&msg, 0, sizeof(msg));
+        iov.iov_base = &req;
+        iov.iov_len = req.n.nlmsg_len;
+        msg.msg_name = &snl;
+        msg.msg_namelen = sizeof(snl);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        if (sendmsg(fd, &msg, 0) < 0) {
+                zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                          "Failed to delete neighbor entry on %s: %s",
+                          r->vr->vrid, r->mvl_ifp->name, safe_strerror(errno));
+                goto out;
+        }
+
+        memset(resp, 0, sizeof(resp));
+        memset(&rmsg, 0, sizeof(rmsg));
+        memset(&riov, 0, sizeof(riov));
+        riov.iov_base = resp;
+        riov.iov_len = sizeof(resp);
+        rmsg.msg_name = &snl;
+        rmsg.msg_namelen = sizeof(snl);
+        rmsg.msg_iov = &riov;
+        rmsg.msg_iovlen = 1;
+
+        if (recvmsg(fd, &rmsg, 0) < 0)
+                zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                          "Failed to receive neighbor delete response on %s: %s",
+                          r->vr->vrid, r->mvl_ifp->name, safe_strerror(errno));
+
+out:
+        if (fd >= 0)
+                close(fd);
+}
+
+static void vrrp_lb_neigh_flush(struct vrrp_router *r)
+{
+        struct listnode *ln, *nn;
+        struct vrrp_lb_neighbor *entry;
+
+        if (!r->lb_static_neigh)
+                return;
+
+        for (ALL_LIST_ELEMENTS(r->lb_static_neigh, ln, nn, entry))
+                vrrp_lb_neigh_delete(r, entry);
+
+        list_delete_all_node(r->lb_static_neigh);
+}
+
 static int vrrp_lb_arp_process(struct vrrp_router *r)
 {
         uint8_t buf[GARP_BUFFER_SIZE];
@@ -384,29 +520,34 @@ static int vrrp_lb_arp_process(struct vrrp_router *r)
 
         bool use_master = (ntohl(sip.s_addr) & 0x1) == 0;
         struct ethaddr reply_mac;
+        bool should_reply = (r->fsm.state == VRRP_STATE_MASTER);
 
         vrrp_mac_set_load_balance(&reply_mac, r->vr->vrid, use_master);
 
-        memcpy(eth->ether_dhost, sender_mac, ETH_ALEN);
-        memcpy(eth->ether_shost, reply_mac.octet, ETH_ALEN);
+        if (should_reply) {
+                memcpy(eth->ether_dhost, sender_mac, ETH_ALEN);
+                memcpy(eth->ether_shost, reply_mac.octet, ETH_ALEN);
 
-        arph->ar_op = htons(ARPOP_REPLY);
-        ptr = (uint8_t *)(arph + 1);
-        memcpy(ptr, reply_mac.octet, ETH_ALEN);
-        ptr += ETH_ALEN;
-        memcpy(ptr, &tip, sizeof(tip));
-        ptr += sizeof(tip);
-        memcpy(ptr, sender_mac, ETH_ALEN);
-        ptr += ETH_ALEN;
-        memcpy(ptr, &sip, sizeof(sip));
+                arph->ar_op = htons(ARPOP_REPLY);
+                ptr = (uint8_t *)(arph + 1);
+                memcpy(ptr, reply_mac.octet, ETH_ALEN);
+                ptr += ETH_ALEN;
+                memcpy(ptr, &tip, sizeof(tip));
+                ptr += sizeof(tip);
+                memcpy(ptr, sender_mac, ETH_ALEN);
+                ptr += ETH_ALEN;
+                memcpy(ptr, &sip, sizeof(sip));
 
-        if (sendto(r->sock_arp, buf, len, 0, (struct sockaddr *)&sll,
-                   sizeof(sll)) < 0)
-                zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
-                          "Failed to send ARP reply on %s: %s",
-                          r->vr->vrid, r->mvl_ifp->name, safe_strerror(errno));
+                if (sendto(r->sock_arp, buf, len, 0,
+                           (struct sockaddr *)&sll, sizeof(sll)) < 0)
+                        zlog_warn(VRRP_LOGPFX VRRP_LOGPFX_VRID
+                                  "Failed to send ARP reply on %s: %s",
+                                  r->vr->vrid, r->mvl_ifp->name,
+                                  safe_strerror(errno));
+        }
 
         vrrp_lb_neigh_update(r, &sip, &reply_mac);
+        vrrp_lb_neighbor_track(r, &sip, &reply_mac);
 
         return 0;
 }
@@ -420,7 +561,8 @@ static int vrrp_lb_arp_read(struct thread *thread)
         if (!r->vr->load_balance || r->family != AF_INET)
                 return 0;
 
-        if (r->fsm.state == VRRP_STATE_MASTER)
+        if (r->fsm.state == VRRP_STATE_MASTER
+            || r->fsm.state == VRRP_STATE_BACKUP)
                 vrrp_lb_arp_process(r);
 
         if (r->sock_arp >= 0)
@@ -479,6 +621,7 @@ int vrrp_lb_arp_start(struct vrrp_router *r)
 void vrrp_lb_arp_stop(struct vrrp_router *r)
 {
         THREAD_OFF(r->t_arp_read);
+        vrrp_lb_neigh_flush(r);
         if (r->sock_arp >= 0) {
                 close(r->sock_arp);
                 r->sock_arp = -1;

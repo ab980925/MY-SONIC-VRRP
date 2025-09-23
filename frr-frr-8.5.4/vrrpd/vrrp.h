@@ -29,6 +29,7 @@
 #include "lib/if.h"
 #include "lib/linklist.h"
 #include "lib/northbound.h"
+#include "lib/prefix.h"
 #include "lib/privs.h"
 #include "lib/stream.h"
 #include "lib/thread.h"
@@ -60,22 +61,28 @@
 #define CS2MS 10
 
 DECLARE_MGROUP(VRRPD);
+DECLARE_MTYPE(VRRP_LB_NEIGH);
 
 /* Northbound */
 extern const struct frr_yang_module_info frr_vrrpd_info;
 
 /* Configured defaults */
 struct vrrp_defaults {
-	uint8_t version;
-	uint8_t priority;
-	uint16_t advertisement_interval;
-	bool preempt_mode;
+        uint8_t version;
+        uint8_t priority;
+        uint16_t advertisement_interval;
+        bool preempt_mode;
 	bool accept_mode;
 	bool checksum_with_ipv4_pseudoheader;
 	bool shutdown;
 };
 
 extern struct vrrp_defaults vd;
+
+struct vrrp_lb_neighbor {
+        struct in_addr ip;
+        struct ethaddr mac;
+};
 
 /* threadmaster */
 extern struct thread_master *master;
@@ -93,10 +100,10 @@ extern struct hash *vrrp_vrouters_hash;
  * in a Virtual Router for either IPv4 or IPv6.
  */
 struct vrrp_router {
-	/*
-	 * Whether this VRRP Router is active.
-	 */
-	bool is_active;
+        /*
+         * Whether this VRRP Router is active.
+         */
+        bool is_active;
 
 	/* Whether we are the address owner */
 	bool is_owner;
@@ -198,6 +205,9 @@ struct vrrp_router {
 
         /* Thread handler that processes packets received on sock_arp. */
         struct thread *t_arp_read;
+
+        /* Cached list of static ARP entries programmed in load balance mode. */
+        struct list *lb_static_neigh;
 
 	struct {
 		int state;
