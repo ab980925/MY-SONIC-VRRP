@@ -143,21 +143,43 @@ lib_interface_vrrp_vrrp_group_lookup_entry(struct nb_cb_lookup_entry_args *args)
 static int
 lib_interface_vrrp_vrrp_group_version_modify(struct nb_cb_modify_args *args)
 {
-	if (args->event != NB_EV_APPLY)
-		return NB_OK;
+        if (args->event != NB_EV_APPLY)
+                return NB_OK;
 
-	struct vrrp_vrouter *vr;
-	uint8_t version;
+        struct vrrp_vrouter *vr;
+        uint8_t version;
 
-	vr = nb_running_get_entry(args->dnode, NULL, true);
-	vrrp_event(vr->v4, VRRP_EVENT_SHUTDOWN);
-	vrrp_event(vr->v6, VRRP_EVENT_SHUTDOWN);
-	version = yang_dnode_get_enum(args->dnode, NULL);
-	vr->version = version;
+        vr = nb_running_get_entry(args->dnode, NULL, true);
+        vrrp_event(vr->v4, VRRP_EVENT_SHUTDOWN);
+        vrrp_event(vr->v6, VRRP_EVENT_SHUTDOWN);
+        version = yang_dnode_get_enum(args->dnode, NULL);
+        vr->version = version;
 
-	vrrp_check_start(vr);
+        vrrp_check_start(vr);
 
-	return NB_OK;
+        return NB_OK;
+}
+
+static int
+lib_interface_vrrp_vrrp_group_mode_modify(struct nb_cb_modify_args *args)
+{
+        if (args->event != NB_EV_APPLY)
+                return NB_OK;
+
+        struct vrrp_vrouter *vr;
+        bool load_balance;
+
+        vr = nb_running_get_entry(args->dnode, NULL, true);
+        load_balance = yang_dnode_get_enum(args->dnode, NULL) != 0;
+
+        vrrp_event(vr->v4, VRRP_EVENT_SHUTDOWN);
+        vrrp_event(vr->v6, VRRP_EVENT_SHUTDOWN);
+
+        vrrp_set_load_balance(vr, load_balance);
+
+        vrrp_check_start(vr);
+
+        return NB_OK;
 }
 
 /*
@@ -637,17 +659,24 @@ const struct frr_yang_module_info frr_vrrpd_info = {
 				.cli_show = cli_show_vrrp,
 			}
 		},
-		{
-			.xpath = "/frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/version",
-			.cbs = {
-				.modify = lib_interface_vrrp_vrrp_group_version_modify,
-			}
-		},
-		{
-			.xpath = "/frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/priority",
-			.cbs = {
-				.modify = lib_interface_vrrp_vrrp_group_priority_modify,
-				.cli_show = cli_show_priority,
+{
+.xpath = "/frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/version",
+.cbs = {
+.modify = lib_interface_vrrp_vrrp_group_version_modify,
+}
+},
+{
+.xpath = "/frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/mode",
+.cbs = {
+.modify = lib_interface_vrrp_vrrp_group_mode_modify,
+.cli_show = cli_show_mode,
+}
+},
+{
+.xpath = "/frr-interface:lib/interface/frr-vrrpd:vrrp/vrrp-group/priority",
+.cbs = {
+.modify = lib_interface_vrrp_vrrp_group_priority_modify,
+.cli_show = cli_show_priority,
 			}
 		},
 		{
