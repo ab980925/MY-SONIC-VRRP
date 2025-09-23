@@ -48,6 +48,7 @@
 
 DEFINE_MTYPE_STATIC(VRRPD, VRRP_IP, "VRRP IP address");
 DEFINE_MTYPE_STATIC(VRRPD, VRRP_RTR, "VRRP Router");
+DEFINE_MTYPE(VRRPD, VRRP_LB_NEIGH, "VRRP load-balance neighbor");
 
 /* statics */
 struct hash *vrrp_vrouters_hash;
@@ -707,9 +708,16 @@ int vrrp_del_ipv4(struct vrrp_vrouter *vr, struct in_addr v4)
 
 static void vrrp_router_addr_list_del_cb(void *val)
 {
-	struct ipaddr *ip = val;
+        struct ipaddr *ip = val;
 
-	XFREE(MTYPE_VRRP_IP, ip);
+        XFREE(MTYPE_VRRP_IP, ip);
+}
+
+static void vrrp_lb_neighbor_list_del_cb(void *val)
+{
+        struct vrrp_lb_neighbor *nbr = val;
+
+        XFREE(MTYPE_VRRP_LB_NEIGH, nbr);
 }
 
 /*
@@ -791,6 +799,9 @@ static struct vrrp_router *vrrp_router_create(struct vrrp_vrouter *vr,
         r->vr = vr;
         r->addrs = list_new();
         r->addrs->del = vrrp_router_addr_list_del_cb;
+        r->lb_static_neigh = list_new();
+        if (r->lb_static_neigh)
+                r->lb_static_neigh->del = vrrp_lb_neighbor_list_del_cb;
         r->priority = vr->priority;
         r->fsm.state = VRRP_STATE_INITIALIZE;
         vrrp_mac_set(&r->vmac, family == AF_INET6, vr->vrid);
@@ -818,9 +829,11 @@ static void vrrp_router_destroy(struct vrrp_router *r)
         if (r->sock_tx >= 0)
                 close(r->sock_tx);
 
-	/* FIXME: also delete list elements */
-	list_delete(&r->addrs);
-	XFREE(MTYPE_VRRP_RTR, r);
+        /* FIXME: also delete list elements */
+        list_delete(&r->addrs);
+        if (r->lb_static_neigh)
+                list_delete(&r->lb_static_neigh);
+        XFREE(MTYPE_VRRP_RTR, r);
 }
 
 struct vrrp_vrouter *vrrp_vrouter_create(struct interface *ifp, uint8_t vrid,
@@ -1638,7 +1651,7 @@ static void vrrp_change_state_backup(struct vrrp_router *r)
                                   "Unable to program backup MAC on %s",
                                   r->vr->vrid, r->mvl_ifp ? r->mvl_ifp->name
                                                          : "<none>");
-                vrrp_lb_arp_stop(r);
+                vrrp_lb_arp_start(r);
         } else
                 vrrp_zclient_send_interface_protodown(r->mvl_ifp, true);
 }
