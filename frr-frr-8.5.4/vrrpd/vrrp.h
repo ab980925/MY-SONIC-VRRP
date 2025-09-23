@@ -209,9 +209,12 @@ struct vrrp_router {
         /* Cached list of static ARP entries programmed in load balance mode. */
         struct list *lb_static_neigh;
 
-	struct {
-		int state;
-	} fsm;
+        /* Whether the load-balance peer is currently considered alive. */
+        bool lb_peer_alive;
+
+        struct {
+                int state;
+        } fsm;
 
 	struct {
 		/* Total number of advertisements sent and received */
@@ -225,10 +228,11 @@ struct vrrp_router {
 		uint32_t trans_cnt;
 	} stats;
 
-	struct thread *t_master_down_timer;
-	struct thread *t_adver_timer;
-	struct thread *t_read;
-	struct thread *t_write;
+        struct thread *t_master_down_timer;
+        struct thread *t_adver_timer;
+        struct thread *t_read;
+        struct thread *t_write;
+        struct thread *t_peer_down_timer;
 };
 
 /*

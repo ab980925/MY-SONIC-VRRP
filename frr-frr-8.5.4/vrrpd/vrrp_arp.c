@@ -518,9 +518,12 @@ static int vrrp_lb_arp_process(struct vrrp_router *r)
         if (!vrrp_lb_match_vip(r, &tip))
                 return 0;
 
-        bool use_master = (ntohl(sip.s_addr) & 0x1) == 0;
+        bool use_master = true;
         struct ethaddr reply_mac;
         bool should_reply = (r->fsm.state == VRRP_STATE_MASTER);
+
+        if (r->lb_peer_alive)
+                use_master = (ntohl(sip.s_addr) & 0x1) == 0;
 
         vrrp_mac_set_load_balance(&reply_mac, r->vr->vrid, use_master);
 
@@ -616,6 +619,31 @@ int vrrp_lb_arp_start(struct vrrp_router *r)
                         &r->t_arp_read);
 
         return 0;
+}
+
+void vrrp_lb_update_all_neighbors(struct vrrp_router *r, bool use_master_only)
+{
+        struct listnode *ln;
+        struct vrrp_lb_neighbor *entry;
+
+        if (!r || !r->lb_static_neigh)
+                return;
+
+        for (ALL_LIST_ELEMENTS_RO(r->lb_static_neigh, ln, entry)) {
+                bool use_master = use_master_only;
+                struct ethaddr desired;
+
+                if (!use_master_only)
+                        use_master = (ntohl(entry->ip.s_addr) & 0x1) == 0;
+
+                vrrp_mac_set_load_balance(&desired, r->vr->vrid, use_master);
+
+                if (!memcmp(&desired, &entry->mac, sizeof(desired)))
+                        continue;
+
+                vrrp_lb_neigh_update(r, &entry->ip, &desired);
+                entry->mac = desired;
+        }
 }
 
 void vrrp_lb_arp_stop(struct vrrp_router *r)

@@ -35,5 +35,7 @@ extern void vrrp_garp_send_all(struct vrrp_router *vr);
 
 extern int vrrp_lb_arp_start(struct vrrp_router *vr);
 extern void vrrp_lb_arp_stop(struct vrrp_router *vr);
+extern void vrrp_lb_update_all_neighbors(struct vrrp_router *vr,
+                                        bool use_master_only);
 
 #endif /* __VRRP_ARP_H__ */
